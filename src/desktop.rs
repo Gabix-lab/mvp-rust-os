@@ -21,7 +21,7 @@ const TASKBAR_BTN_W: usize = 176;
 const MIN_VISIBLE: isize = 48;
 
 const CURSOR_W: usize = 16;
-const CURSOR_H: usize = 20;
+const CURSOR_H: usize = CURSOR_SHAPE.len();
 
 #[derive(Clone, Copy)]
 struct Rgb(u8, u8, u8);
@@ -115,6 +115,56 @@ impl Rect {
             && y >= self.y
             && y < self.y + self.h as isize
     }
+
+    fn intersect(self, other: Rect) -> Option<Rect> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = (self.x + self.w as isize).min(other.x + other.w as isize);
+        let y1 = (self.y + self.h as isize).min(other.y + other.h as isize);
+        if x1 <= x0 || y1 <= y0 {
+            None
+        } else {
+            Some(Rect {
+                x: x0,
+                y: y0,
+                w: (x1 - x0) as usize,
+                h: (y1 - y0) as usize,
+            })
+        }
+    }
+
+    fn union(self, other: Rect) -> Rect {
+        let x0 = self.x.min(other.x);
+        let y0 = self.y.min(other.y);
+        let x1 = (self.x + self.w as isize).max(other.x + other.w as isize);
+        let y1 = (self.y + self.h as isize).max(other.y + other.h as isize);
+        Rect {
+            x: x0,
+            y: y0,
+            w: (x1 - x0) as usize,
+            h: (y1 - y0) as usize,
+        }
+    }
+}
+
+fn window_outer(window: Window) -> Rect {
+    // Border is one pixel outside the window and the shadow extends five to the
+    // right and six down, so this rectangle covers every painted pixel.
+    Rect {
+        x: window.x - 2,
+        y: window.y - 2,
+        w: window.w + 9,
+        h: window.h + 10,
+    }
+}
+
+fn menu_outer(menu: Rect) -> Rect {
+    Rect {
+        x: menu.x - 2,
+        y: menu.y - 2,
+        w: menu.w + 9,
+        h: menu.h + 10,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -146,6 +196,8 @@ pub struct Desktop {
     menu_open: bool,
     clicks: u32,
     hover: Hover,
+    clip: Rect,
+    dirty: Option<Rect>,
     cursor_active: bool,
     cursor_x: usize,
     cursor_y: usize,
@@ -204,6 +256,13 @@ impl Desktop {
             menu_open: false,
             clicks: 0,
             hover: Hover::None,
+            clip: Rect {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+            },
+            dirty: None,
             cursor_active: false,
             cursor_x: 0,
             cursor_y: 0,
@@ -261,6 +320,16 @@ impl Desktop {
         }
     }
 
+    fn counter_number_rect(&self, idx: usize) -> Rect {
+        let window = self.windows[idx];
+        Rect {
+            x: window.x + 26,
+            y: window.y + 66,
+            w: window.w.saturating_sub(52),
+            h: 32,
+        }
+    }
+
     fn menu_button_rect(&self) -> Rect {
         Rect {
             x: 6,
@@ -298,6 +367,76 @@ impl Desktop {
         }
     }
 
+    fn screen_rect(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: self.width,
+            h: self.height,
+        }
+    }
+
+    fn window_outer_rect(&self, idx: usize) -> Rect {
+        window_outer(self.windows[idx])
+    }
+
+    fn menu_outer_rect(&self) -> Rect {
+        menu_outer(self.menu_rect())
+    }
+
+    /// Add a rectangle to the pending repaint region. Damage is merged into a
+    /// single bounding box, which keeps the renderer simple while still
+    /// avoiding full-screen redraws for ordinary pointer motion.
+    fn damage(&mut self, rect: Rect) {
+        let Some(rect) = rect.intersect(self.screen_rect()) else {
+            return;
+        };
+        self.dirty = Some(match self.dirty {
+            Some(current) => current.union(rect),
+            None => rect,
+        });
+    }
+
+    fn hover_rect(&self, hover: Hover) -> Option<Rect> {
+        match hover {
+            Hover::None => None,
+            Hover::Menu => Some(self.menu_button_rect()),
+            Hover::Task(idx) => Some(self.task_button_rect(idx)),
+            Hover::StartItem(idx) => Some(self.menu_item_rect(idx)),
+            Hover::Close(idx) => Some(self.close_rect(idx)),
+            Hover::Counter => self
+                .windows
+                .iter()
+                .position(|window| window.kind == WindowKind::Counter)
+                .map(|idx| self.counter_button_rect(idx)),
+        }
+    }
+
+    fn damage_z_change(&mut self, old_top: usize, new_top: usize) {
+        if old_top == new_top {
+            return;
+        }
+        self.damage(self.window_outer_rect(old_top));
+        self.damage(self.window_outer_rect(new_top));
+        self.damage(self.task_button_rect(old_top));
+        self.damage(self.task_button_rect(new_top));
+    }
+
+    /// Repaint every open window and taskbar button. Used for the occasional
+    /// state change (open, close, focus) where the active titlebar moves.
+    fn damage_window_state(&mut self) {
+        for idx in 0..WINDOW_COUNT {
+            if self.windows[idx].open {
+                self.damage(self.window_outer_rect(idx));
+            }
+            self.damage(self.task_button_rect(idx));
+        }
+        self.damage(self.menu_button_rect());
+        if self.menu_open {
+            self.damage(self.menu_outer_rect());
+        }
+    }
+
     // ------------------------------------------------------------------
     // Window state
     // ------------------------------------------------------------------
@@ -310,17 +449,14 @@ impl Desktop {
             .find(|&idx| self.windows[idx].open)
     }
 
-    fn bring_to_front(&mut self, idx: usize) {
-        if self.z_order[WINDOW_COUNT - 1] != idx {
-            let other = self.z_order[WINDOW_COUNT - 1];
-            self.z_order = [other, idx];
+    fn bring_to_front(&mut self, idx: usize) -> bool {
+        let top = self.z_order[WINDOW_COUNT - 1];
+        if top != idx {
+            self.z_order = [top, idx];
+            true
+        } else {
+            false
         }
-    }
-
-    fn open_window(&mut self, idx: usize) {
-        self.windows[idx].open = true;
-        self.bring_to_front(idx);
-        self.menu_open = false;
     }
 
     fn hover_at(&self, mx: usize, my: usize) -> Hover {
@@ -365,36 +501,53 @@ impl Desktop {
         Hover::None
     }
 
-    fn press(&mut self, mx: usize, my: usize) -> bool {
+    fn press(&mut self, mx: usize, my: usize) {
         if (my as isize) >= self.taskbar_y() {
             if self.menu_button_rect().contains(mx, my) {
                 self.menu_open = !self.menu_open;
                 self.drag = None;
-                return true;
+                self.damage(self.menu_button_rect());
+                self.damage(self.menu_outer_rect());
+                return;
             }
 
             let menu_was_open = self.menu_open;
             self.menu_open = false;
             for idx in 0..WINDOW_COUNT {
                 if self.task_button_rect(idx).contains(mx, my) {
-                    self.open_window(idx);
-                    return true;
+                    self.windows[idx].open = true;
+                    self.bring_to_front(idx);
+                    if menu_was_open {
+                        self.damage(self.menu_outer_rect());
+                    }
+                    self.damage_window_state();
+                    return;
                 }
             }
-            return menu_was_open;
+            if menu_was_open {
+                self.damage(self.menu_outer_rect());
+                self.damage(self.menu_button_rect());
+            }
+            return;
         }
 
         if self.menu_open {
             if self.menu_rect().contains(mx, my) {
                 for idx in 0..WINDOW_COUNT {
                     if self.menu_item_rect(idx).contains(mx, my) {
-                        self.open_window(idx);
-                        return true;
+                        self.windows[idx].open = true;
+                        self.bring_to_front(idx);
+                        self.menu_open = false;
+                        self.damage(self.menu_outer_rect());
+                        self.damage_window_state();
+                        return;
                     }
                 }
             }
             self.menu_open = false;
-            return true;
+            self.damage(self.menu_outer_rect());
+            self.damage(self.menu_button_rect());
+            return;
         }
 
         for &idx in self.z_order.iter().rev() {
@@ -405,79 +558,73 @@ impl Desktop {
             if self.close_rect(idx).contains(mx, my) {
                 self.windows[idx].open = false;
                 self.drag = None;
-                return true;
+                self.damage(self.window_outer_rect(idx));
+                self.damage_window_state();
+                return;
             }
 
             if self.titlebar_rect(idx).contains(mx, my) {
                 let window = self.windows[idx];
+                let old_top = self.z_order[WINDOW_COUNT - 1];
                 self.bring_to_front(idx);
                 self.drag = Some(Drag {
                     idx,
                     off_x: mx as isize - window.x,
                     off_y: my as isize - window.y,
                 });
-                return true;
+                self.damage_z_change(old_top, self.z_order[WINDOW_COUNT - 1]);
+                return;
             }
 
             if self.windows[idx].kind == WindowKind::Counter
                 && self.counter_button_rect(idx).contains(mx, my)
             {
+                let old_top = self.z_order[WINDOW_COUNT - 1];
                 self.bring_to_front(idx);
+                self.damage_z_change(old_top, self.z_order[WINDOW_COUNT - 1]);
                 self.clicks = self.clicks.wrapping_add(1);
                 crate::serial_println!("CLICK COUNTER: count = {}", self.clicks);
-                return true;
+                self.damage(self.counter_number_rect(idx));
+                self.damage(self.counter_button_rect(idx));
+                return;
             }
 
             if self.active_window() != Some(idx) {
+                let old_top = self.z_order[WINDOW_COUNT - 1];
                 self.bring_to_front(idx);
-                return true;
+                self.damage_z_change(old_top, self.z_order[WINDOW_COUNT - 1]);
             }
-            return false;
+            return;
         }
-
-        false
     }
 
-    /// Process one mouse update. Returns `true` when the whole desktop needs
-    /// to be repainted; otherwise a simple cursor move is enough.
-    pub fn on_mouse(&mut self, state: &MouseState) -> bool {
-        let mut full_redraw = false;
-
-        if state.left_released {
-            crate::serial_println!("DESKTOP: release at ({},{})", state.x, state.y);
-            if self.drag.take().is_some() {
-                full_redraw = true;
-            }
+    /// Process one mouse update and accumulate the region that needs repainting.
+    pub fn on_mouse(&mut self, state: &MouseState) {
+        if state.left_pressed {
+            self.press(state.x, state.y);
         }
 
         if let Some(drag) = self.drag {
-            crate::serial_println!(
-                "DESKTOP: drag window {} down={} to ({},{})",
-                drag.idx,
-                state.left_down,
-                state.x,
-                state.y
-            );
-            if state.left_down {
+            if state.left_down || state.left_released {
                 let taskbar_y = self.taskbar_y();
-                let window = &mut self.windows[drag.idx];
+                let window = self.windows[drag.idx];
                 let min_x = MIN_VISIBLE - window.w as isize;
                 let max_x = self.width as isize - MIN_VISIBLE;
                 let max_y = (taskbar_y - TITLEBAR_H as isize).max(0);
                 let new_x = (state.x as isize - drag.off_x).clamp(min_x, max_x);
                 let new_y = (state.y as isize - drag.off_y).clamp(0, max_y);
                 if window.x != new_x || window.y != new_y {
-                    window.x = new_x;
-                    window.y = new_y;
-                    crate::serial_println!("DESKTOP: moved window to ({},{})", new_x, new_y);
-                    full_redraw = true;
+                    let old_rect = self.window_outer_rect(drag.idx);
+                    self.windows[drag.idx].x = new_x;
+                    self.windows[drag.idx].y = new_y;
+                    self.damage(old_rect);
+                    self.damage(self.window_outer_rect(drag.idx));
                 }
             }
         }
 
-        if state.left_pressed {
-            crate::serial_println!("DESKTOP: press at ({},{})", state.x, state.y);
-            full_redraw |= self.press(state.x, state.y);
+        if state.left_released {
+            self.drag = None;
         }
 
         let new_hover = if self.drag.is_none() && !state.left_down {
@@ -486,11 +633,41 @@ impl Desktop {
             Hover::None
         };
         if new_hover != self.hover {
+            if let Some(rect) = self.hover_rect(self.hover) {
+                self.damage(rect);
+            }
+            if let Some(rect) = self.hover_rect(new_hover) {
+                self.damage(rect);
+            }
             self.hover = new_hover;
-            full_redraw = true;
         }
+    }
 
-        full_redraw
+    /// Repaint the pending damage region, then put the cursor back on top.
+    /// Returns false when there was nothing to repaint.
+    pub fn render_damage(&mut self, buf: &mut [u8], mx: usize, my: usize) -> bool {
+        let Some(damage) = self.dirty.take() else {
+            return false;
+        };
+
+        self.restore_cursor(buf);
+        self.clip = damage;
+        self.draw_background(buf);
+
+        let active = self.active_window();
+        for &idx in self.z_order.iter() {
+            if self.windows[idx].open {
+                self.draw_window(buf, idx, active == Some(idx));
+            }
+        }
+        if self.menu_open {
+            self.draw_menu(buf);
+        }
+        self.draw_taskbar(buf, active);
+
+        self.clip = self.screen_rect();
+        self.draw_cursor(buf, mx, my);
+        true
     }
 
     // ------------------------------------------------------------------
@@ -545,14 +722,14 @@ impl Desktop {
             return;
         }
 
-        let x0 = x.max(0) as usize;
-        let y0 = y.max(0) as usize;
-        let x1 = x
-            .saturating_add(w as isize)
-            .clamp(0, self.width as isize) as usize;
-        let y1 = y
-            .saturating_add(h as isize)
-            .clamp(0, self.height as isize) as usize;
+        let target = Rect { x, y, w, h };
+        let Some(area) = self.clip.intersect(target) else {
+            return;
+        };
+        let x0 = area.x.max(0) as usize;
+        let y0 = area.y.max(0) as usize;
+        let x1 = (area.x + area.w as isize).clamp(0, self.width as isize) as usize;
+        let y1 = (area.y + area.h as isize).clamp(0, self.height as isize) as usize;
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -668,7 +845,9 @@ impl Desktop {
 
     fn draw_background(&self, buf: &mut [u8]) {
         let height = self.height;
-        for y in 0..height {
+        let y0 = self.clip.y.max(0) as usize;
+        let y1 = (self.clip.y + self.clip.h as isize).clamp(0, height as isize) as usize;
+        for y in y0..y1 {
             let t = if height > 1 {
                 (y * 255 / (height - 1)) as i32
             } else {
@@ -689,6 +868,9 @@ impl Desktop {
 
     fn draw_window(&self, buf: &mut [u8], idx: usize, active: bool) {
         let window = self.windows[idx];
+        if self.clip.intersect(window_outer(window)).is_none() {
+            return;
+        }
         let title_color = if active { TITLE_ACTIVE } else { TITLE_INACTIVE };
 
         self.fill_rect(
@@ -861,6 +1043,9 @@ impl Desktop {
 
     fn draw_menu(&self, buf: &mut [u8]) {
         let menu = self.menu_rect();
+        if self.clip.intersect(menu_outer(menu)).is_none() {
+            return;
+        }
 
         self.fill_rect(buf, menu.x + 4, menu.y + 5, menu.w, menu.h, SHADOW);
         self.fill_rect(
@@ -904,6 +1089,15 @@ impl Desktop {
 
     fn draw_taskbar(&self, buf: &mut [u8], active: Option<usize>) {
         let y = self.taskbar_y();
+        let bar = Rect {
+            x: 0,
+            y,
+            w: self.width,
+            h: TASKBAR_H,
+        };
+        if self.clip.intersect(bar).is_none() {
+            return;
+        }
         self.fill_rect(buf, 0, y, self.width, TASKBAR_H, TASKBAR_BG);
         self.fill_rect(buf, 0, y, self.width, 2, TASKBAR_ACCENT);
 
@@ -958,6 +1152,8 @@ impl Desktop {
     }
 
     pub fn render_full(&mut self, buf: &mut [u8], mx: usize, my: usize) {
+        self.dirty = None;
+        self.clip = self.screen_rect();
         self.cursor_active = false;
         self.draw_background(buf);
 

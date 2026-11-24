@@ -38,7 +38,7 @@ const CMD_ABSPOINTER_STATUS: u32 = 0x28;
 const CMD_ABSPOINTER_COMMAND: u32 = 0x29;
 const CMD_ABSPOINTER_DATA: u32 = 0x27;
 
-const ARG_ENABLE: u32 = 0x4541_4552;
+const ARG_READ_ID: u32 = 0x4541_4552;
 const ARG_ABSOLUTE: u32 = 0x5342_4152;
 const ARG_DISABLE: u32 = 0x0000_00F5;
 
@@ -81,7 +81,7 @@ unsafe fn probe_vmmouse() {
     }
 
     // Ask the device to identify itself: this queues VMMOUSE_VERSION.
-    let _ = unsafe { vm_call(CMD_ABSPOINTER_COMMAND, ARG_ENABLE) };
+    let _ = unsafe { vm_call(CMD_ABSPOINTER_COMMAND, ARG_READ_ID) };
     let (status, _, _) = unsafe { vm_call(CMD_ABSPOINTER_STATUS, 0) };
     let queue_len = status & 0xFFFF;
     if queue_len == 0 || (status & 0xFFFF_0000) == VMMOUSE_ERROR {
@@ -182,12 +182,6 @@ pub fn ps2_feed(byte: u8) {
 
             let x = CUR_X.load(Ordering::Acquire);
             let y = CUR_Y.load(Ordering::Acquire);
-            crate::serial_println!(
-                "PS2 PACKET: flags={:#04x} dx={} dy={}",
-                flags,
-                dx,
-                dy
-            );
             if (flags & 0xC0) == 0 {
                 set_pos(x + dx * 2, y - dy * 2);
             }
@@ -202,7 +196,7 @@ pub fn poll_absolute() {
         return;
     }
 
-    for _ in 0..8 {
+    for _ in 0..64 {
         let (status, _, _) = unsafe { vm_call(CMD_ABSPOINTER_STATUS, 0) };
         if (status & 0xFFFF_0000) == VMMOUSE_ERROR {
             disable_vmmouse("status error");

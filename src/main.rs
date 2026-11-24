@@ -172,9 +172,10 @@ unsafe fn init_pic() {
     }
 }
 
-/// Program PIT channel 0 to roughly 100 Hz.
+/// Program PIT channel 0 to roughly 200 Hz. The timer is only a wake-up
+/// source for the main loop, which polls the absolute pointer.
 unsafe fn init_pit() {
-    const DIVISOR: u16 = 11_932; // 1.193182 MHz / 11932 ~= 100 Hz
+    const DIVISOR: u16 = 5_966; // 1.193182 MHz / 5966 ~= 200 Hz
     unsafe {
         serial::outb(0x43, 0x36); // channel 0, lobyte/hibyte, mode 3, binary
         serial::outb(0x40, DIVISOR as u8);
@@ -279,7 +280,7 @@ unsafe fn init_ps2_mouse() {
     let _ = ps2_write_mouse(0xF5); // disable data reporting while configuring
     let _ = ps2_write_mouse(0xF6); // set defaults
     let _ = ps2_write_mouse(0xF3);
-    let _ = ps2_write_mouse(100); // 100 samples per second
+    let _ = ps2_write_mouse(200); // 200 samples per second
     let _ = ps2_write_mouse(0xF4); // enable data reporting
     ps2_flush_output();
 }
@@ -318,7 +319,6 @@ extern "x86-interrupt" fn ignore_irq(_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn timer_irq(_frame: InterruptStackFrame) {
-    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
     eoi_master();
 }
 
@@ -332,12 +332,12 @@ extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn mouse_irq(_frame: InterruptStackFrame) {
-    // QEMU's vmmouse sends IRQ12 as a "data available" notification without
-    // data in the 8042; real PS/2 packets do show up with OBF and AUX set.
+    // QEMU's vmmouse injects synthetic PS/2 packets alongside absolute events;
+    // input::ps2_feed drops those while the absolute pointer is active. Real
+    // PS/2 bytes arrive here with OBF and AUX set in the 8042 status register.
     let status = unsafe { serial::inb(0x64) };
     if (status & 0x01) != 0 {
         let byte = unsafe { serial::inb(0x60) };
-        serial_println!("IRQ12: status {:#04x} byte {:#04x}", status, byte);
         if (status & 0x20) != 0 {
             input::ps2_feed(byte);
         }
@@ -398,10 +398,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("RUST OS: interrupts enabled, desktop ready");
 
     let state = input::take_state();
-    let start = TIMER_TICKS.load(Ordering::Relaxed);
     desktop.render_full(buffer, state.x, state.y);
-    let end = TIMER_TICKS.load(Ordering::Relaxed);
-    serial_println!("RENDER: initial full redraw took {} ticks", end - start);
 
     loop {
         unsafe {
@@ -414,18 +411,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             continue;
         }
 
-        let before = TIMER_TICKS.load(Ordering::Relaxed);
-        let full_redraw = desktop.on_mouse(&state);
-        let after_logic = TIMER_TICKS.load(Ordering::Relaxed);
-        if full_redraw {
-            desktop.render_full(buffer, state.x, state.y);
-            let after_render = TIMER_TICKS.load(Ordering::Relaxed);
-            serial_println!(
-                "RENDER: logic {} ticks, full redraw {} ticks",
-                after_logic - before,
-                after_render - after_logic
-            );
-        } else if state.moved {
+        desktop.on_mouse(&state);
+        if !desktop.render_damage(buffer, state.x, state.y) && state.moved {
             desktop.draw_cursor(buffer, state.x, state.y);
         }
     }
